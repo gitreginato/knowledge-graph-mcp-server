@@ -1,0 +1,11 @@
+# Dados sensiveis (LGPD) - nunca commitar
+kg.db
+kg.db-wal
+kg.db-shm
+backups/
+graph.json
+graph.html
+GRAPH_REPORT.md
+grafo-out/
+__pycache__/
+*.pyc

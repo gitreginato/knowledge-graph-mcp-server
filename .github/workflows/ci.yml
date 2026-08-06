@@ -1,0 +1,13 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pytest test_kg_infra.py -x -q
+      - run: python -c "import server; print('import ok')"
+      - run: python -c "import cli; print('cli ok')"

@@ -7,7 +7,7 @@ Python puro + SQLite, zero dependencias, 100% local (LGPD-safe).
 
 O kg-infra tem 2 componentes:
 
-1. **MCP server** (`server.py`): servidor stdio JSON-RPC com 24 tools. Configurado em
+1. **MCP server** (`server.py`): servidor stdio JSON-RPC com 36 tools. Configurado em
    `~/.config/devin/mcp_config.json` (Devin) e `~/.gemini/config/mcp_config.json` (Antigravity).
 2. **Skill** (`~/.config/devin/skills/kg-infra/SKILL.md`): guia de uso que ensina o agente
    a traduzir perguntas em linguagem natural para chamadas das tools MCP corretas.
@@ -42,7 +42,7 @@ Para gerar tudo de uma vez: `export_all {}` (tool MCP).
 
 | Skill | O que faz | Path |
 |---|---|---|
-| `kg-infra` | Guia de uso das 24 tools MCP (NL -> tool) | `~/.config/devin/skills/kg-infra/SKILL.md` |
+| `kg-infra` | Guia de uso das 36 tools MCP (NL -> tool) | `~/.config/devin/skills/kg-infra/SKILL.md` |
 | `robustness-audit` | Audita robustez de implementacao (8 categorias) | `~/.config/devin/skills/robustness-audit/SKILL.md` |
 | `design-viz` | Design de visualizacoes interativas (grafos, charts) | `~/.config/devin/skills/design-viz/SKILL.md` |
 | `data-storytelling` | Narrativa de dados (tese, causality, stakes, change) | `~/.config/devin/skills/data-storytelling/SKILL.md` |
@@ -51,12 +51,22 @@ Para gerar tudo de uma vez: `export_all {}` (tool MCP).
 
 | Capacidade | graphify | kg-infra |
 |---|---|---|
-| Parsing de codigo (AST) | tree-sitter, 40+ linguagens | Nao (feito para negocio, nao codigo) |
+| Parsing de codigo (AST) | tree-sitter, 40+ linguagens | Sim (Python via ast module do stdlib, zero deps) |
 | Deteccao de comunidades | Leiden (C++, leidenalg) | Louvain em Python puro (sem deps) |
 | Visualizacao interativa | graph.html (vis.js) | graph.html (vis.js CDN, SRI, CSS inline) |
 | Relatorio automatico | GRAPH_REPORT.md | GRAPH_REPORT.md (god nodes, surprising connections) |
 | Metricas de centralidade | Implicito (god nodes) | PageRank, betweenness, closeness, degree (Python puro) |
 | Telemetria/tracing | Nao | telemetry_spans (latencia p50/p90, top tools, erros) |
+| Blast radius (impacto de remocao) | Nao | get_impact (nos afetados por distancia) |
+| Multi-path entre dois nos | Nao | trace_paths (multiplos caminhos, max 10) |
+| Explain de no (subgrafo + contexto) | Nao | explain_node (vizinhos, arestas, summary) |
+| What-if (simulacao de remocao) | Nao | what_if_remove (edges_lost, nodes_isolated) |
+| Replay de trace de execucao | Nao | replay_trace (spans ordenados, call_tree) |
+| Deteccao de nos isolados | Nao | find_orphans (orphan_nodes, ambiguous_edges) |
+| Call graph (quem chama quem) | Sim (tree-sitter) | get_call_graph (BFS no grafo de CALLS_FUNC) |
+| Import graph (arquivos vs modulos) | Sim (tree-sitter) | get_import_graph (via ast module) |
+| Deteccao de imports circulares | Sim (tree-sitter) | find_circular_imports (DFS no grafo de imports) |
+| Code impact (blast radius de funcao) | Sim (tree-sitter) | get_code_impact (BFS no grafo de CALLS_FUNC) |
 | Query semantica (NL) | graphify query "pergunta" | Prompt template (LLM traduz para search_graph/trace_path) |
 | Provenance | EXTRACTED/INFERRED | EXTRACTED/INFERRED/AMBIGUOUS (mais granular) |
 | Audit log | Nao | audit_log (C9 OWASP) |
@@ -79,7 +89,7 @@ Dados de negocio (CSV, JSON, tickets, propostas, PDFs)
 [3] SQLite (kg.db) armazena grafo com provenance + audit_log + telemetry
         |
         v
-[4] Devin/Antigravity consultam via 24 tools MCP
+[4] Devin/Antigravity consultam via 36 tools MCP
         |
         v
 [5] Export: graph.html (vis.js) + GRAPH_REPORT.md + graph.json
@@ -88,7 +98,7 @@ Dados de negocio (CSV, JSON, tickets, propostas, PDFs)
 ## Arquivos
 
 - `schema.sql` - Schema SQLite (nodes, edges, FTS5, communities, metadata, audit_log, telemetry_spans)
-- `server.py` - MCP server (JSON-RPC 2.0 over stdio, 24 tools, 1484 linhas)
+- `server.py` - MCP server (JSON-RPC 2.0 over stdio, 36 tools)
 - `cli.py` - CLI para testes manuais
 - `export.py` - Export para graph.json
 - `seed.py` - Dados sinteticos de exemplo (23 nos, 28 arestas)
@@ -98,7 +108,7 @@ Dados de negocio (CSV, JSON, tickets, propostas, PDFs)
 - `THREAT-MODEL.md` - Threat model (STRIDE + Zero Trust + OWASP LLM)
 - `.gitignore` - Protege kg.db, graph.json, graph.html
 
-## Ferramentas MCP (24)
+## Ferramentas MCP (36)
 
 ### Escrita (para Antigravity popular)
 - `add_node` - Cria um no (label, name, properties, provenance)
@@ -129,6 +139,22 @@ Dados de negocio (CSV, JSON, tickets, propostas, PDFs)
 - `health_check` - Health check: status (ok/degraded/critical), db_size, node_count, latency_p50, error_rate, integrity
 - `integrity_check` - Verifica integridade do banco SQLite (PRAGMA integrity_check + arestas orfas)
 - `backup` - Cria backup manual do banco via VACUUM INTO (rotacao 30 dias)
+
+### Analise avancada (impacto, caminhos, diagnostico)
+- `get_impact` - Blast radius de um no: nos afetados agrupados por distancia (node, max_depth default 3 max 5, direction outgoing/incoming/both default both)
+- `trace_paths` - Multiplos caminhos entre dois nos (source, target, max_paths default 3 max 10, max_hops default 8 max 15)
+- `explain_node` - Subgrafo ao redor de um no com contexto: no, vizinhos, arestas e summary (node, depth default 1 max 2, limit_neighbors default 20 max 50)
+- `what_if_remove` - Simula remocao de um no: edges_lost, nodes_isolated, communities_affected, isolation_risk (node)
+- `replay_trace` - Reconstrui fluxo de execucao: spans ordenados, duracao total, call_tree (trace_id, limit default 100 max 500)
+- `get_impact_summary` - Resume impacto de um tipo de aresta: total_edges, source_labels, target_labels, affected_nodes (edge_type, limit default 20)
+- `find_orphans` - Encontra nos isolados e arestas AMBIGUOUS: orphan_nodes, ambiguous_edges (limit default 50 max 200)
+
+### Tools de codigo (AST parsing)
+- `scan_codebase` - Mapeia diretorio de codigo Python via ast module (zero deps, sem LLM, sem tree-sitter). Extrai functions, classes, imports, calls e adiciona como nos/arestas no grafo (path, max_files default 200 max 1000, exclude lista de dirs para ignorar)
+- `get_call_graph` - Grafo de chamadas: quem chama quem (project?, direction outgoing/incoming/both default both, limit default 100 max 500)
+- `get_import_graph` - Grafo de imports: quais arquivos importam quais modulos (project?, limit default 100 max 500)
+- `find_circular_imports` - Detecta imports circulares via DFS no grafo de imports (project?, max_depth default 10 max 20)
+- `get_code_impact` - Blast radius de uma funcao: se mudar esta funcao, quais outras sao afetadas. Faz BFS no grafo de CALLS_FUNC (function id ou qualified_name, max_depth default 3 max 5)
 
 ## Query semantica (natural language)
 
@@ -215,7 +241,7 @@ python3 cli.py export_html '{}'
 - **PII filter**: `get_node` redacta propriedades sensiveis (email, phone, cpf, cnpj, password, token, secret, api_key, credit_card) antes de retornar
 - **Provenance**: Cada no e aresta taggeado (EXTRACTED/INFERRED/AMBIGUOUS)
 - **Auditoria**: Cada operacao de escrita registrada em `audit_log` (C9 OWASP). Consultavel via `query_graph`.
-- **Telemetria**: Cada chamada de tool registrada em `telemetry_spans` com latencia, args (truncados, sem PII), erros.
+- **Telemetria**: Cada chamada de tool registrada em `telemetry_spans` com latencia, args (truncados, sem PII), erros, agent_id (qual agente executou: Devin, subagent, etc), cost_usd (custo estimado em USD), checkpoint (estado serializado do grafo).
 - **Type validation**: `delete_node` e `set_community` validam tipos de input (inteiro positivo, string length)
 - **Edge upsert**: `ON CONFLICT DO UPDATE` preserva o id (nao `INSERT OR REPLACE` que deleta e recria)
 - **SRI (Subresource Integrity)**: vis.js CDN carregado com hash SHA-384, bloqueia CDN comprometido

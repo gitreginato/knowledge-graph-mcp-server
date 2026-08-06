@@ -33,6 +33,8 @@ VALID_LABELS = {
     "Event", "Document", "Note", "Tag", "Person", "Organization",
     # Infraestrutura/codigo (expandido para mapear codebase real)
     "Project", "Module", "Config", "Folder", "File",
+    # AST / parsing de codigo (como graphify, mas com ast module do Python)
+    "Function", "Class", "Import", "Variable", "Decorator",
 }
 
 # Allowlist de tipos de aresta
@@ -48,6 +50,9 @@ VALID_EDGE_TYPES = {
     "CONTAINS", "USES", "DOCUMENTS", "IMPLEMENTS", "TESTS", "DEFINES",
     "EXPOSES_MCP", "CONFIGURES", "RUNS", "MONITORS", "INTEGRATES_WITH",
     "DEPENDS_ON", "IMPORTS", "CALLS", "HAS_MODULE",
+    # AST / parsing de codigo
+    "DEFINES_FUNC", "DEFINES_CLASS", "DECORATES", "INHERITS_FROM",
+    "IMPORTS_FROM", "CALLS_FUNC", "READS_VAR", "WRITES_VAR",
 }
 
 VALID_PROVENANCE = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
@@ -878,6 +883,7 @@ def tool_export_html(args):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none';">
 <title>kg-infra: Knowledge Graph</title>
 <style>
 :root {{
@@ -1955,8 +1961,1099 @@ def tool_backup(args):
 
 
 # ============================================================
-# Protocolo MCP (JSON-RPC 2.0 over stdio)
+# Task 7: Analise de impacto, caminhos, contexto e telemetria
 # ============================================================
+
+def tool_get_impact(args):
+    """Blast radius de um no: quais nos seriam afetados se este fosse removido?
+    Faz BFS a partir do no, agrupando afetados por distancia (hop 1, hop 2, etc).
+    Args: node (id ou qualified_name), max_depth? (default 3, max 5),
+          direction? (outgoing/incoming/both, default both)"""
+    node_ref = args["node"]
+    if not isinstance(node_ref, (int, str)):
+        raise ValueError("node deve ser id (int) ou qualified_name (str)")
+    max_depth = min(args.get("max_depth", 3), 5)
+    if max_depth < 1:
+        raise ValueError("max_depth deve ser >= 1")
+    direction = args.get("direction", "both")
+    if direction not in ("outgoing", "incoming", "both"):
+        raise ValueError("direction deve ser: outgoing, incoming ou both")
+
+    conn = get_db()
+    try:
+        node_id = _resolve_node(conn, node_ref)
+        if node_id is None:
+            return {"error": f"No nao encontrado: {node_ref}"}
+
+        # Guarda: nao carregar grafo inteiro se for muito grande
+        total_edges = conn.execute("SELECT COUNT(*) as c FROM edges").fetchone()["c"]
+        if total_edges > MAX_GRAPH_NODES_FOR_ALGO * 10:
+            return {"error": f"Grafo muito grande ({total_edges} arestas). Use max_depth=1 ou reduza o grafo."}
+
+        # Carregar arestas UMA vez, construir adjacencia conforme direction
+        rows = conn.execute("SELECT source_id, target_id FROM edges").fetchall()
+        adj = {}
+        for r in rows:
+            if direction != "incoming":
+                adj.setdefault(r["source_id"], set()).add(r["target_id"])
+            if direction != "outgoing":
+                adj.setdefault(r["target_id"], set()).add(r["source_id"])
+
+        # BFS em memoria, agrupando por profundidade
+        by_depth = {}
+        visited = {node_id}
+        queue = deque([(node_id, 0)])
+        while queue:
+            current, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for nid in adj.get(current, set()):
+                if nid not in visited:
+                    visited.add(nid)
+                    next_depth = depth + 1
+                    by_depth.setdefault(next_depth, []).append(nid)
+                    queue.append((nid, next_depth))
+
+        # Resolver info dos nos afetados em 1 query (nao 2)
+        affected_ids = set()
+        for ids in by_depth.values():
+            affected_ids.update(ids)
+        node_info = {}
+        affected_labels = {}
+        if affected_ids:
+            if len(affected_ids) > 900:
+                affected_ids = set(list(affected_ids)[:900])
+            placeholders = ",".join("?" * len(affected_ids))
+            for r in conn.execute(
+                f"SELECT id, label, name, qualified_name FROM nodes WHERE id IN ({placeholders})",
+                list(affected_ids),
+            ).fetchall():
+                node_info[r["id"]] = {"id": r["id"], "label": r["label"], "name": r["name"], "qualified_name": r["qualified_name"]}
+                lbl = r["label"]
+                affected_labels[lbl] = affected_labels.get(lbl, 0) + 1
+
+        by_depth_serialized = {str(k): [node_info.get(nid, {"id": nid}) for nid in v] for k, v in sorted(by_depth.items())}
+
+        return {
+            "node": node_id,
+            "affected_count": len(affected_ids),
+            "by_depth": by_depth_serialized,
+            "affected_labels": affected_labels,
+        }
+    finally:
+        conn.close()
+
+
+def tool_trace_paths(args):
+    """Multiplos caminhos entre dois nos (DFS iterativo com poda).
+    Args: source, target, max_paths? (default 3, max 10), max_hops? (default 8, max 15)"""
+    source = args["source"]
+    target = args["target"]
+    if not isinstance(source, (int, str)):
+        raise ValueError("source deve ser id (int) ou qualified_name (str)")
+    if not isinstance(target, (int, str)):
+        raise ValueError("target deve ser id (int) ou qualified_name (str)")
+    max_paths = min(args.get("max_paths", 3), 10)
+    if max_paths < 1:
+        raise ValueError("max_paths deve ser >= 1")
+    max_hops = min(args.get("max_hops", 8), 15)
+    if max_hops < 1:
+        raise ValueError("max_hops deve ser >= 1")
+
+    conn = get_db()
+    try:
+        source_id = _resolve_node(conn, source)
+        target_id = _resolve_node(conn, target)
+        if source_id is None:
+            return {"error": f"Source nao encontrado: {source}"}
+        if target_id is None:
+            return {"error": f"Target nao encontrado: {target}"}
+        if source_id == target_id:
+            return {"paths": [[source_id]], "count": 1, "truncated": False}
+
+        # Guarda: nao carregar grafo inteiro se for muito grande
+        total_edges = conn.execute("SELECT COUNT(*) as c FROM edges").fetchone()["c"]
+        if total_edges > MAX_GRAPH_NODES_FOR_ALGO * 10:
+            return {"error": f"Grafo muito grande ({total_edges} arestas). Use max_hops menor."}
+
+        # Carregar arestas uma vez (grafo nao-direcional para caminhos)
+        rows = conn.execute("SELECT source_id, target_id FROM edges").fetchall()
+        adj = {}
+        for r in rows:
+            adj.setdefault(r["source_id"], set()).add(r["target_id"])
+            adj.setdefault(r["target_id"], set()).add(r["source_id"])
+
+        # DFS iterativo com poda: stack de (current, path, visited)
+        paths = []
+        truncated = False
+        stack = [(source_id, [source_id], {source_id})]
+        while stack:
+            if len(paths) >= max_paths:
+                truncated = True
+                break
+            current, path, vis = stack.pop()
+            if len(path) - 1 >= max_hops:
+                continue
+            for nid in adj.get(current, set()):
+                if nid == target_id:
+                    paths.append(path + [nid])
+                    continue
+                if nid not in vis:
+                    stack.append((nid, path + [nid], vis | {nid}))
+
+        return {"paths": paths, "count": len(paths), "truncated": truncated}
+    finally:
+        conn.close()
+
+
+def tool_explain_node(args):
+    """Subgrafo ao redor de um no com contexto: no, vizinhos diretos, arestas entre eles.
+    Args: node (id ou qualified_name), depth? (default 1, max 2), limit_neighbors? (default 20, max 50)"""
+    node_ref = args["node"]
+    if not isinstance(node_ref, (int, str)):
+        raise ValueError("node deve ser id (int) ou qualified_name (str)")
+    depth = min(args.get("depth", 1), 2)
+    if depth < 1:
+        raise ValueError("depth deve ser >= 1")
+    limit_neighbors = min(args.get("limit_neighbors", 20), 50)
+    if limit_neighbors < 1:
+        raise ValueError("limit_neighbors deve ser >= 1")
+
+    conn = get_db()
+    try:
+        node_id = _resolve_node(conn, node_ref)
+        if node_id is None:
+            return {"error": f"No nao encontrado: {node_ref}"}
+
+        # Detalhes do no (colunas explicitas, nao SELECT *)
+        row = conn.execute(
+            "SELECT id, label, name, qualified_name, properties, provenance, source FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if not row:
+            return {"error": "No nao encontrado"}
+        try:
+            props = json.loads(row["properties"]) if row["properties"] else {}
+        except (json.JSONDecodeError, TypeError):
+            props = {}
+        node_data = {
+            "id": row["id"], "label": row["label"], "name": row["name"],
+            "qualified_name": row["qualified_name"],
+            "properties": _filter_sensitive_props(props),
+            "provenance": row["provenance"], "source": row["source"],
+        }
+
+        # Vizinhos diretos (arestas de saida e entrada)
+        out_edges = conn.execute(
+            """SELECT e.id, e.type, e.provenance, e.weight, e.properties,
+                      n.id as target_id, n.label as target_label, n.name as target_name, n.qualified_name as target_qualified_name
+               FROM edges e JOIN nodes n ON e.target_id = n.id WHERE e.source_id = ? LIMIT ?""",
+            (node_id, limit_neighbors),
+        ).fetchall()
+        in_edges = conn.execute(
+            """SELECT e.id, e.type, e.provenance, e.weight, e.properties,
+                      n.id as source_id, n.label as source_label, n.name as source_name, n.qualified_name as source_qualified_name
+               FROM edges e JOIN nodes n ON e.source_id = n.id WHERE e.target_id = ? LIMIT ?""",
+            (node_id, limit_neighbors),
+        ).fetchall()
+
+        def _safe_props(raw):
+            try:
+                return json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+
+        neighbors = {}
+        edges = []
+        for e in out_edges:
+            neighbors[e["target_id"]] = {"id": e["target_id"], "label": e["target_label"], "name": e["target_name"], "qualified_name": e["target_qualified_name"]}
+            edges.append({"id": e["id"], "type": e["type"], "provenance": e["provenance"], "weight": e["weight"],
+                          "source": node_id, "target": e["target_id"],
+                          "properties": _safe_props(e["properties"])})
+        for e in in_edges:
+            neighbors[e["source_id"]] = {"id": e["source_id"], "label": e["source_label"], "name": e["source_name"], "qualified_name": e["source_qualified_name"]}
+            edges.append({"id": e["id"], "type": e["type"], "provenance": e["provenance"], "weight": e["weight"],
+                          "source": e["source_id"], "target": node_id,
+                          "properties": _safe_props(e["properties"])})
+
+        # Se depth=2, buscar arestas entre os vizinhos (limite de placeholders)
+        if depth == 2 and neighbors:
+            neighbor_ids = list(neighbors.keys())[:450]  # SQLite limita ~999 params
+            if neighbor_ids:
+                placeholders = ",".join("?" * len(neighbor_ids))
+                inner_edges = conn.execute(
+                    f"""SELECT e.id, e.type, e.provenance, e.weight, e.source_id, e.target_id, e.properties
+                        FROM edges e WHERE e.source_id IN ({placeholders}) AND e.target_id IN ({placeholders})""",
+                    neighbor_ids + neighbor_ids,
+                ).fetchall()
+                for e in inner_edges:
+                    edges.append({"id": e["id"], "type": e["type"], "provenance": e["provenance"], "weight": e["weight"],
+                                  "source": e["source_id"], "target": e["target_id"],
+                                  "properties": _safe_props(e["properties"])})
+
+        neighbor_list = list(neighbors.values())[:limit_neighbors]
+        summary = f"{node_data['name']} ({node_data['label']}) e conectado a {len(neighbor_list)} nos via {len(out_edges) + len(in_edges)} arestas"
+
+        return {
+            "node": node_data,
+            "neighbors": neighbor_list,
+            "edges": edges,
+            "summary": summary,
+        }
+    finally:
+        conn.close()
+
+
+def tool_what_if_remove(args):
+    """Simula remocao de um no sem remove-lo. Calcula nos que ficariam isolados,
+    arestas perdidas e comunidades afetadas.
+    Args: node (id ou qualified_name)"""
+    node_ref = args["node"]
+    if not isinstance(node_ref, (int, str)):
+        raise ValueError("node deve ser id (int) ou qualified_name (str)")
+
+    conn = get_db()
+    try:
+        node_id = _resolve_node(conn, node_ref)
+        if node_id is None:
+            return {"error": f"No nao encontrado: {node_ref}"}
+
+        # Arestas que seriam perdidas (CASCADE)
+        edges_lost = conn.execute(
+            "SELECT COUNT(*) as c FROM edges WHERE source_id = ? OR target_id = ?",
+            (node_id, node_id),
+        ).fetchone()["c"]
+
+        # Nos que perderiam conexao: vizinhos diretos que ficam isolados sem este no
+        neighbor_rows = conn.execute(
+            """SELECT DISTINCT n.id FROM nodes n
+               JOIN edges e ON (e.source_id = n.id AND e.target_id = ?) OR (e.target_id = n.id AND e.source_id = ?)
+               WHERE n.id != ?""",
+            (node_id, node_id, node_id),
+        ).fetchall()
+        neighbor_ids = [r["id"] for r in neighbor_rows][:450]  # Limite de placeholders SQLite
+
+        # Para cada vizinho, verificar se teria outras arestas (sem o no removido)
+        nodes_that_lose = []
+        if neighbor_ids:
+            placeholders = ",".join("?" * len(neighbor_ids))
+            for r in conn.execute(
+                f"""SELECT n.id,
+                    (SELECT COUNT(*) FROM edges e WHERE (e.source_id = n.id OR e.target_id = n.id)
+                     AND e.source_id != ? AND e.target_id != ?) as remaining_edges
+                    FROM nodes n WHERE n.id IN ({placeholders})""",
+                [node_id, node_id] + neighbor_ids,
+            ).fetchall():
+                if r["remaining_edges"] == 0:
+                    nodes_that_lose.append(r["id"])
+
+        # Comunidades afetadas
+        comm_row = conn.execute(
+            "SELECT community_id FROM communities WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        communities_affected = []
+        if comm_row:
+            comm_id = comm_row["community_id"]
+            # Quantos nos na mesma comunidade
+            comm_size = conn.execute(
+                "SELECT COUNT(*) as c FROM communities WHERE community_id = ?", (comm_id,)
+            ).fetchone()["c"]
+            communities_affected.append({"community_id": comm_id, "size_before": comm_size, "size_after": comm_size - 1})
+
+        # Risk: high se >5 nos isolados ou >10 arestas perdidas, medium se >0, low se 0
+        isolated_count = len(nodes_that_lose)
+        if isolated_count > 5 or edges_lost > 10:
+            isolation_risk = "high"
+        elif isolated_count > 0 or edges_lost > 0:
+            isolation_risk = "medium"
+        else:
+            isolation_risk = "low"
+
+        # Resolver nomes dos nos que perdem conexao
+        lose_info = []
+        if nodes_that_lose:
+            nodes_that_lose = nodes_that_lose[:450]  # Limite de placeholders SQLite
+            placeholders = ",".join("?" * len(nodes_that_lose))
+            for r in conn.execute(
+                f"SELECT id, label, name, qualified_name FROM nodes WHERE id IN ({placeholders})",
+                nodes_that_lose,
+            ).fetchall():
+                lose_info.append({"id": r["id"], "label": r["label"], "name": r["name"], "qualified_name": r["qualified_name"]})
+
+        return {
+            "node": node_id,
+            "edges_lost": edges_lost,
+            "nodes_that_lose_connection": lose_info,
+            "communities_affected": communities_affected,
+            "isolation_risk": isolation_risk,
+        }
+    finally:
+        conn.close()
+
+
+def tool_replay_trace(args):
+    """Reconstroi o fluxo de execucao a partir de telemetry_spans de um trace_id.
+    Retorna spans ordenados por timestamp, com duracao acumulada, erros e arvore de chamadas.
+    Args: trace_id, limit? (default 100, max 500)"""
+    trace_id = args["trace_id"]
+    if not isinstance(trace_id, str) or not trace_id:
+        raise ValueError("trace_id e obrigatorio e deve ser string")
+    limit = min(args.get("limit", 100), 500)
+    if limit < 1:
+        raise ValueError("limit deve ser >= 1")
+
+    conn = get_db()
+    try:
+        # Verificar se tabela existe
+        try:
+            conn.execute("SELECT 1 FROM telemetry_spans LIMIT 1")
+        except sqlite3.OperationalError:
+            return {"error": "Tabela telemetry_spans nao existe. Rode o schema atualizado."}
+
+        rows = conn.execute(
+            """SELECT span_id, parent_id, tool, duration_ms, error, args_summary,
+                      agent_id, cost_usd, timestamp
+               FROM telemetry_spans WHERE trace_id = ? ORDER BY timestamp LIMIT ?""",
+            (trace_id, limit),
+        ).fetchall()
+
+        if not rows:
+            return {"trace_id": trace_id, "spans": [], "total_duration_ms": 0, "error_count": 0, "call_tree": {}}
+
+        spans = []
+        total_duration = 0
+        error_count = 0
+        for r in rows:
+            total_duration += r["duration_ms"] if r["duration_ms"] else 0
+            has_error = r["error"] is not None and r["error"] != ""
+            if has_error:
+                error_count += 1
+            spans.append({
+                "span_id": r["span_id"], "parent_id": r["parent_id"], "tool": r["tool"],
+                "duration_ms": r["duration_ms"], "error": r["error"], "args_summary": r["args_summary"],
+                "agent_id": r["agent_id"], "cost_usd": r["cost_usd"], "timestamp": r["timestamp"],
+            })
+
+        # Construir arvore de chamadas (parent_id -> children)
+        span_map = {s["span_id"]: {**s, "children": []} for s in spans}
+        roots = []
+        for s in spans:
+            if s["parent_id"] and s["parent_id"] in span_map:
+                span_map[s["parent_id"]]["children"].append(span_map[s["span_id"]])
+            else:
+                roots.append(span_map[s["span_id"]])
+
+        call_tree = {"roots": roots} if len(roots) == 1 else {"roots": roots}
+
+        return {
+            "trace_id": trace_id,
+            "spans": spans,
+            "total_duration_ms": round(total_duration, 2),
+            "error_count": error_count,
+            "call_tree": call_tree,
+        }
+    finally:
+        conn.close()
+
+
+def tool_get_impact_summary(args):
+    """Resume o impacto de um tipo de aresta no grafo: quantos nos dependem dessa relacao,
+    quais labels sao mais afetados.
+    Args: edge_type, limit? (default 20)"""
+    edge_type = args["edge_type"]
+    validate_edge_type(edge_type)
+    limit = min(args.get("limit", 20), 100)
+    if limit < 1:
+        raise ValueError("limit deve ser >= 1")
+
+    conn = get_db()
+    try:
+        # Total de arestas desse tipo
+        total_edges = conn.execute(
+            "SELECT COUNT(*) as c FROM edges WHERE type = ?", (edge_type,)
+        ).fetchone()["c"]
+
+        if total_edges == 0:
+            return {"edge_type": edge_type, "total_edges": 0, "source_labels": [], "target_labels": [], "affected_nodes": 0}
+
+        # Labels dos sources
+        source_labels = conn.execute(
+            """SELECT n.label, COUNT(*) as c FROM edges e
+               JOIN nodes n ON e.source_id = n.id WHERE e.type = ?
+               GROUP BY n.label ORDER BY c DESC LIMIT ?""",
+            (edge_type, limit),
+        ).fetchall()
+
+        # Labels dos targets
+        target_labels = conn.execute(
+            """SELECT n.label, COUNT(*) as c FROM edges e
+               JOIN nodes n ON e.target_id = n.id WHERE e.type = ?
+               GROUP BY n.label ORDER BY c DESC LIMIT ?""",
+            (edge_type, limit),
+        ).fetchall()
+
+        # Nos afetados (distintos: sources + targets)
+        affected = conn.execute(
+            """SELECT COUNT(DISTINCT nid) as c FROM (
+                SELECT source_id as nid FROM edges WHERE type = ?
+                UNION
+                SELECT target_id as nid FROM edges WHERE type = ?
+            )""",
+            (edge_type, edge_type),
+        ).fetchone()["c"]
+
+        return {
+            "edge_type": edge_type,
+            "total_edges": total_edges,
+            "source_labels": [{"label": r["label"], "count": r["c"]} for r in source_labels],
+            "target_labels": [{"label": r["label"], "count": r["c"]} for r in target_labels],
+            "affected_nodes": affected,
+        }
+    finally:
+        conn.close()
+
+
+def tool_find_orphans(args):
+    """Encontra nos sem arestas (isolados) e arestas com provenance AMBIGUOUS.
+    Args: limit? (default 50, max 200)"""
+    limit = args.get("limit", 50)
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit deve ser inteiro >= 1")
+    limit = min(limit, 200)
+
+    conn = get_db()
+    try:
+        # Nos isolados: sem arestas de saida nem entrada
+        orphan_nodes = conn.execute(
+            """SELECT n.id, n.label, n.name, n.qualified_name, n.provenance
+               FROM nodes n
+               WHERE n.id NOT IN (SELECT source_id FROM edges)
+                 AND n.id NOT IN (SELECT target_id FROM edges)
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+        # Arestas com provenance AMBIGUOUS
+        ambiguous_edges = conn.execute(
+            """SELECT e.id, e.type, e.provenance, e.weight,
+                      ns.label as source_label, ns.name as source_name,
+                      nt.label as target_label, nt.name as target_name
+               FROM edges e
+               JOIN nodes ns ON e.source_id = ns.id
+               JOIN nodes nt ON e.target_id = nt.id
+               WHERE e.provenance = 'AMBIGUOUS'
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+        return {
+            "orphan_nodes": [
+                {"id": r["id"], "label": r["label"], "name": r["name"],
+                 "qualified_name": r["qualified_name"], "provenance": r["provenance"]}
+                for r in orphan_nodes
+            ],
+            "ambiguous_edges": [
+                {"id": r["id"], "type": r["type"], "provenance": r["provenance"], "weight": r["weight"],
+                 "source": {"label": r["source_label"], "name": r["source_name"]},
+                 "target": {"label": r["target_label"], "name": r["target_name"]}}
+                for r in ambiguous_edges
+            ],
+            "orphan_count": len(orphan_nodes),
+            "ambiguous_count": len(ambiguous_edges),
+        }
+    finally:
+        conn.close()
+
+
+# ============================================================
+# Task 8: Tools de codigo (AST parsing, como graphify mas leve)
+# Usa ast module do Python stdlib (zero dependencias)
+# ============================================================
+
+def _safe_json_loads_list(raw):
+    """json.loads com fallback seguro para lista vazia."""
+    if not raw:
+        return []
+    try:
+        result = json.loads(raw)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _parse_python_file(filepath):
+    """Faz parse de um arquivo Python via ast module.
+    Retorna: {functions: [{name, lineno, args, decorators}], classes: [{name, lineno, bases, methods}],
+              imports: [{module, names, lineno}], calls: [{caller, func, lineno}]}
+    Leve: usa ast.parse do stdlib, sem LLM, sem tree-sitter."""
+    import ast as _ast
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+        tree = _ast.parse(source, filename=filepath)
+    except (SyntaxError, ValueError, OSError):
+        return None
+
+    functions = []
+    classes = []
+    imports = []
+    calls = []
+
+    class _Visitor(_ast.NodeVisitor):
+        def __init__(self):
+            self.current_class = None
+            self.current_func = None
+
+        def visit_FunctionDef(self, node):
+            decos = [_ast.unparse(d) if hasattr(_ast, 'unparse') else '' for d in node.decorator_list]
+            func_info = {
+                "name": node.name,
+                "lineno": node.lineno,
+                "args": [a.arg for a in node.args.args],
+                "decorators": decos,
+                "class": self.current_class,
+            }
+            functions.append(func_info)
+            old_func = self.current_func
+            self.current_func = node.name
+            self.generic_visit(node)
+            self.current_func = old_func
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):
+            bases = [_ast.unparse(b) if hasattr(_ast, 'unparse') else str(getattr(b, 'id', '')) for b in node.bases]
+            classes.append({
+                "name": node.name,
+                "lineno": node.lineno,
+                "bases": bases,
+                "methods": [n.name for n in node.body if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))],
+            })
+            old_class = self.current_class
+            self.current_class = node.name
+            self.generic_visit(node)
+            self.current_class = old_class
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                imports.append({"module": alias.name, "names": [], "lineno": node.lineno, "from": False})
+
+        def visit_ImportFrom(self, node):
+            module = node.module or ""
+            names = [alias.name for alias in node.names]
+            imports.append({"module": module, "names": names, "lineno": node.lineno, "from": True})
+
+        def visit_Call(self, node):
+            try:
+                func_name = _ast.unparse(node.func) if hasattr(_ast, 'unparse') else ''
+            except Exception:
+                func_name = ''
+            if func_name and self.current_func:
+                calls.append({
+                    "caller": self.current_func,
+                    "func": func_name,
+                    "lineno": node.lineno,
+                    "class": self.current_class,
+                })
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return {"functions": functions, "classes": classes, "imports": imports, "calls": calls}
+
+
+def tool_scan_codebase(args):
+    """Mapeia um diretorio de codigo Python via ast module (zero deps, sem LLM).
+    Extrai functions, classes, imports, calls e adiciona como nos/arestas no grafo.
+    Args: path (diretorio raiz do projeto), max_files? (default 200, max 1000),
+          exclude? (lista de dirs para ignorar, default: __pycache__, .git, venv, node_modules)"""
+    import ast as _ast  # ja importado em _parse_python_file, mas explicito aqui
+    path = args["path"]
+    if not isinstance(path, str) or not path:
+        raise ValueError("path e obrigatorio e deve ser string")
+    if len(path) > 4096:
+        raise ValueError("path muito longo (max 4096 chars)")
+    max_files = min(args.get("max_files", 200), 1000)
+    if max_files < 1:
+        raise ValueError("max_files deve ser >= 1")
+    exclude = set(args.get("exclude", ["__pycache__", ".git", "venv", ".venv", "node_modules", ".tox", "build", "dist"]))
+    if not os.path.isdir(path):
+        return {"error": f"Diretorio nao encontrado: {path}"}
+
+    # Defesa contra path traversal: resolver path real e nao seguir symlinks
+    resolved_path = os.path.realpath(path)
+    if not resolved_path.startswith("/home/"):
+        return {"error": "Path deve estar dentro de /home/ (defesa contra path traversal)"}
+
+    # Coletar arquivos .py
+    py_files = []
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in exclude]
+        for f in files:
+            if f.endswith(".py"):
+                py_files.append(os.path.join(root, f))
+                if len(py_files) >= max_files:
+                    break
+        if len(py_files) >= max_files:
+            break
+
+    if not py_files:
+        return {"error": "Nenhum arquivo .py encontrado", "path": path}
+
+    project_name = os.path.basename(os.path.abspath(path))
+    proj_qname = f"proj:{normalize_name(project_name)}"
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # Upsert do no do projeto
+        proj_row = conn.execute("SELECT id FROM nodes WHERE qualified_name = ?", (proj_qname,)).fetchone()
+        if proj_row:
+            proj_id = proj_row["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO nodes (label, name, qualified_name, properties, provenance, source) VALUES (?, ?, ?, ?, ?, ?)",
+                ("Project", project_name, proj_qname, json.dumps({"path": path}), "EXTRACTED", "scan_codebase"),
+            )
+            proj_id = cur.lastrowid
+            audit_log(conn, "node_create", "node", proj_id, "Project", proj_qname, "scan_codebase")
+
+        stats = {"files": 0, "functions": 0, "classes": 0, "imports": 0, "calls": 0, "errors": 0}
+        file_nodes = {}  # filepath -> node_id
+
+        for filepath in py_files:
+            rel_path = os.path.relpath(filepath, path)
+            file_qname = f"file:{normalize_name(project_name)}:{rel_path.replace('/', ':')}"
+            # Upsert file node
+            row = conn.execute("SELECT id FROM nodes WHERE qualified_name = ?", (file_qname,)).fetchone()
+            if row:
+                file_id = row["id"]
+            else:
+                cur = conn.execute(
+                    "INSERT INTO nodes (label, name, qualified_name, properties, provenance, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("File", rel_path, file_qname, json.dumps({"path": filepath}), "EXTRACTED", "scan_codebase"),
+                )
+                file_id = cur.lastrowid
+                audit_log(conn, "node_create", "node", file_id, "File", file_qname, "scan_codebase")
+            file_nodes[filepath] = file_id
+            # Edge: project CONTAINS file
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, type, provenance) VALUES (?, ?, 'CONTAINS', 'EXTRACTED')",
+                (proj_id, file_id),
+            )
+
+            # Parse do arquivo
+            parsed = _parse_python_file(filepath)
+            if parsed is None:
+                stats["errors"] += 1
+                continue
+            stats["files"] += 1
+
+            # Functions
+            func_node_ids = {}
+            for func in parsed["functions"]:
+                func_qname = f"func:{normalize_name(project_name)}:{rel_path.replace('/', ':')}:{func['name']}"
+                func_props = json.dumps({
+                    "lineno": func["lineno"],
+                    "args": func["args"],
+                    "decorators": func["decorators"],
+                    "class": func["class"],
+                })
+                row = conn.execute("SELECT id FROM nodes WHERE qualified_name = ?", (func_qname,)).fetchone()
+                if row:
+                    fid = row["id"]
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO nodes (label, name, qualified_name, properties, provenance, source) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("Function", func["name"], func_qname, func_props, "EXTRACTED", "scan_codebase"),
+                    )
+                    fid = cur.lastrowid
+                    audit_log(conn, "node_create", "node", fid, "Function", func_qname, "scan_codebase")
+                func_node_ids[func["name"]] = fid
+                # Edge: file DEFINES_FUNC function
+                conn.execute(
+                    "INSERT OR IGNORE INTO edges (source_id, target_id, type, provenance) VALUES (?, ?, 'DEFINES_FUNC', 'EXTRACTED')",
+                    (file_id, fid),
+                )
+                stats["functions"] += 1
+
+            # Classes
+            for cls in parsed["classes"]:
+                cls_qname = f"class:{normalize_name(project_name)}:{rel_path.replace('/', ':')}:{cls['name']}"
+                cls_props = json.dumps({"lineno": cls["lineno"], "bases": cls["bases"], "methods": cls["methods"]})
+                row = conn.execute("SELECT id FROM nodes WHERE qualified_name = ?", (cls_qname,)).fetchone()
+                if row:
+                    cid = row["id"]
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO nodes (label, name, qualified_name, properties, provenance, source) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("Class", cls["name"], cls_qname, cls_props, "EXTRACTED", "scan_codebase"),
+                    )
+                    cid = cur.lastrowid
+                    audit_log(conn, "node_create", "node", cid, "Class", cls_qname, "scan_codebase")
+                # Edge: file DEFINES_CLASS class
+                conn.execute(
+                    "INSERT OR IGNORE INTO edges (source_id, target_id, type, provenance) VALUES (?, ?, 'DEFINES_CLASS', 'EXTRACTED')",
+                    (file_id, cid),
+                )
+                # Edge: class INHERITS_FROM base (se houver)
+                for base in cls["bases"]:
+                    base_qname = f"class:{normalize_name(base)}"
+                    base_row = conn.execute("SELECT id FROM nodes WHERE qualified_name = ?", (base_qname,)).fetchone()
+                    if base_row:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO edges (source_id, target_id, type, provenance) VALUES (?, ?, 'INHERITS_FROM', 'INFERRED')",
+                            (cid, base_row["id"]),
+                        )
+                stats["classes"] += 1
+
+            # Imports
+            for imp in parsed["imports"]:
+                imp_qname = f"import:{normalize_name(project_name)}:{rel_path.replace('/', ':')}:{normalize_name(imp['module'])}"
+                imp_props = json.dumps({"module": imp["module"], "names": imp["names"], "lineno": imp["lineno"], "from": imp["from"]})
+                row = conn.execute("SELECT id FROM nodes WHERE qualified_name = ?", (imp_qname,)).fetchone()
+                if row:
+                    iid = row["id"]
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO nodes (label, name, qualified_name, properties, provenance, source) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("Import", imp["module"], imp_qname, imp_props, "EXTRACTED", "scan_codebase"),
+                    )
+                    iid = cur.lastrowid
+                    audit_log(conn, "node_create", "node", iid, "Import", imp_qname, "scan_codebase")
+                # Edge: file IMPORTS_FROM module
+                conn.execute(
+                    "INSERT OR IGNORE INTO edges (source_id, target_id, type, provenance) VALUES (?, ?, 'IMPORTS_FROM', 'EXTRACTED')",
+                    (file_id, iid),
+                )
+                stats["imports"] += 1
+
+            # Calls (function -> function)
+            for call in parsed["calls"]:
+                caller_id = func_node_ids.get(call["caller"])
+                if caller_id is None:
+                    continue
+                if not call.get("func"):
+                    continue
+                # Buscar se a funcao chamada existe no mesmo projeto
+                called_name = call["func"].split(".")[-1]  # ex: os.path.join -> join
+                called_qname = f"func:{normalize_name(project_name)}:{called_name}"
+                called_row = conn.execute(
+                    "SELECT id FROM nodes WHERE qualified_name = ? OR name = ?",
+                    (called_qname, called_name),
+                ).fetchone()
+                if called_row and called_row["id"] != caller_id:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO edges (source_id, target_id, type, provenance) VALUES (?, ?, 'CALLS_FUNC', 'EXTRACTED')",
+                        (caller_id, called_row["id"]),
+                    )
+                    stats["calls"] += 1
+
+        conn.commit()
+        return {"project": proj_qname, "project_id": proj_id, "stats": stats, "files_scanned": len(py_files)}
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def tool_get_call_graph(args):
+    """Gera grafo de chamadas: quem chama quem.
+    Args: project? (qualified_name do projeto, default: todos),
+          direction? (outgoing/incoming/both, default both),
+          limit? (default 100, max 500)"""
+    project = args.get("project")
+    if project is not None and not isinstance(project, str):
+        raise ValueError("project deve ser string ou omitido")
+    direction = args.get("direction", "both")
+    if direction not in ("outgoing", "incoming", "both"):
+        raise ValueError("direction deve ser: outgoing, incoming ou both")
+    limit = min(args.get("limit", 100), 500)
+    if limit < 1:
+        raise ValueError("limit deve ser >= 1")
+
+    conn = get_db()
+    try:
+        # Filtrar por projeto se especificado
+        where_clause = ""
+        params = []
+        if project:
+            where_clause = " AND EXISTS (SELECT 1 FROM edges e2 JOIN nodes pf ON e2.source_id = pf.id WHERE e2.target_id = n.id AND pf.qualified_name = ? AND e2.type = 'DEFINES_FUNC')"
+            params = [project]
+
+        # Buscar functions que tem CALLS_FUNC edges
+        if direction in ("outgoing", "both"):
+            out_edges = conn.execute(
+                f"""SELECT n.id, n.name, n.qualified_name, e.target_id, tn.name as target_name, tn.qualified_name as target_qname
+                    FROM nodes n
+                    JOIN edges e ON e.source_id = n.id AND e.type = 'CALLS_FUNC'
+                    JOIN nodes tn ON e.target_id = tn.id
+                    WHERE n.label = 'Function'{where_clause}
+                    LIMIT ?""",
+                params + [limit],
+            ).fetchall()
+        else:
+            out_edges = []
+
+        if direction in ("incoming", "both"):
+            in_edges = conn.execute(
+                f"""SELECT n.id, n.name, n.qualified_name, e.source_id, sn.name as source_name, sn.qualified_name as source_qname
+                    FROM nodes n
+                    JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS_FUNC'
+                    JOIN nodes sn ON e.source_id = sn.id
+                    WHERE n.label = 'Function'{where_clause}
+                    LIMIT ?""",
+                params + [limit],
+            ).fetchall()
+        else:
+            in_edges = []
+
+        callers = {}
+        callees = {}
+        for r in out_edges:
+            callees.setdefault(r["id"], {"name": r["name"], "qualified_name": r["qualified_name"], "calls": []})
+            callees[r["id"]]["calls"].append({"id": r["target_id"], "name": r["target_name"], "qualified_name": r["target_qname"]})
+        for r in in_edges:
+            callers.setdefault(r["id"], {"name": r["name"], "qualified_name": r["qualified_name"], "called_by": []})
+            callers[r["id"]]["called_by"].append({"id": r["source_id"], "name": r["source_name"], "qualified_name": r["source_qname"]})
+
+        return {
+            "outgoing": list(callees.values())[:limit],
+            "incoming": list(callers.values())[:limit],
+            "total_outgoing": len(out_edges),
+            "total_incoming": len(in_edges),
+        }
+    finally:
+        conn.close()
+
+
+def tool_get_import_graph(args):
+    """Gera grafo de imports: quais arquivos importam quais modulos.
+    Args: project? (qualified_name do projeto, default: todos),
+          limit? (default 100, max 500)"""
+    project = args.get("project")
+    if project is not None and not isinstance(project, str):
+        raise ValueError("project deve ser string ou omitido")
+    limit = min(args.get("limit", 100), 500)
+    if limit < 1:
+        raise ValueError("limit deve ser >= 1")
+
+    conn = get_db()
+    try:
+        where_clause = ""
+        params = []
+        if project:
+            where_clause = " AND EXISTS (SELECT 1 FROM edges e2 JOIN nodes pf ON e2.source_id = pf.id WHERE e2.target_id = n.id AND pf.qualified_name = ? AND e2.type IN ('CONTAINS', 'DEFINES_FUNC'))"
+            params = [project]
+
+        edges = conn.execute(
+            f"""SELECT n.id as file_id, n.name as file_name, n.qualified_name as file_qname,
+                      i.id as import_id, i.name as module, i.qualified_name as import_qname,
+                      json_extract(i.properties, '$.names') as imported_names
+                FROM nodes n
+                JOIN edges e ON e.source_id = n.id AND e.type = 'IMPORTS_FROM'
+                JOIN nodes i ON e.target_id = i.id
+                WHERE n.label = 'File'{where_clause}
+                LIMIT ?""",
+            params + [limit],
+        ).fetchall()
+
+        imports = {}
+        for r in edges:
+            file_qname = r["file_qname"]
+            if file_qname not in imports:
+                imports[file_qname] = {"file": r["file_name"], "qualified_name": file_qname, "imports": []}
+            imports[file_qname]["imports"].append({
+                "module": r["module"],
+                "names": _safe_json_loads_list(r["imported_names"]),
+            })
+
+        return {
+            "files": list(imports.values())[:limit],
+            "total_imports": len(edges),
+        }
+    finally:
+        conn.close()
+
+
+def tool_find_circular_imports(args):
+    """Detecta imports circulares no grafo de codigo.
+    Faz DFS no grafo de IMPORTS_FROM procurando ciclos.
+    Args: project? (qualified_name do projeto, default: todos),
+          max_depth? (default 10, max 20)"""
+    project = args.get("project")
+    if project is not None and not isinstance(project, str):
+        raise ValueError("project deve ser string ou omitido")
+    max_depth = min(args.get("max_depth", 10), 20)
+    if max_depth < 2:
+        raise ValueError("max_depth deve ser >= 2")
+
+    conn = get_db()
+    try:
+        # Carregar grafo de imports (File -> Import -> File que define o modulo)
+        # Se project especificado, filtrar para files desse projeto
+        if project:
+            rows = conn.execute(
+                """SELECT e.source_id as file_id, i.name as module, i.properties
+                   FROM edges e JOIN nodes i ON e.target_id = i.id
+                   WHERE e.type = 'IMPORTS_FROM'
+                     AND EXISTS (
+                       SELECT 1 FROM edges e2 JOIN nodes pf ON e2.source_id = pf.id
+                       WHERE e2.target_id = e.source_id AND pf.qualified_name = ?
+                         AND e2.type = 'CONTAINS'
+                     )""",
+                (project,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT e.source_id as file_id, i.name as module, i.properties
+                   FROM edges e JOIN nodes i ON e.target_id = i.id
+                   WHERE e.type = 'IMPORTS_FROM'""",
+            ).fetchall()
+
+        # Mapear: module_name -> [file_ids que definem esse modulo]
+        module_to_files = {}
+        file_to_modules = {}
+        for r in rows:
+            file_to_modules.setdefault(r["file_id"], set()).add(r["module"])
+            module_to_files.setdefault(r["module"], set()).add(r["file_id"])
+
+        # Para cada file, quais outros files ele importa (via modulo)
+        adj = {}
+        for file_id, modules in file_to_modules.items():
+            for mod in modules:
+                for target_file in module_to_files.get(mod, set()):
+                    if target_file != file_id:
+                        adj.setdefault(file_id, set()).add(target_file)
+
+        # DFS para detectar ciclos
+        cycles = []
+        visited = set()
+        for start in adj:
+            if start in visited:
+                continue
+            stack = [(start, [start], {start})]
+            while stack:
+                current, path, vis = stack.pop()
+                if len(path) > max_depth:
+                    continue
+                for neighbor in adj.get(current, set()):
+                    if neighbor in vis:
+                        # Ciclo encontrado: achar onde comeca no path
+                        if neighbor in path:
+                            cycle_start = path.index(neighbor)
+                            cycle = path[cycle_start:] + [neighbor]
+                            if len(cycle) > 1:
+                                cycles.append(cycle)
+                    elif neighbor not in visited:
+                        stack.append((neighbor, path + [neighbor], vis | {neighbor}))
+                visited.add(current)
+
+        # Resolver nomes dos files nos ciclos
+        cycle_results = []
+        seen_cycles = set()
+        for cycle in cycles:
+            cycle_key = tuple(sorted(set(cycle)))
+            if cycle_key in seen_cycles:
+                continue
+            seen_cycles.add(cycle_key)
+            if len(cycle) > 1:
+                cycle_ids = list(set(cycle))
+                # Validar que cycle_ids sao inteiros (defesa contra SQL injection)
+                if not all(isinstance(c, int) for c in cycle_ids):
+                    continue
+                placeholders = ",".join("?" * len(cycle_ids))
+                file_names = {}
+                for r in conn.execute(
+                    f"SELECT id, name, qualified_name FROM nodes WHERE id IN ({placeholders})",
+                    cycle_ids,
+                ).fetchall():
+                    file_names[r["id"]] = {"name": r["name"], "qualified_name": r["qualified_name"]}
+                cycle_results.append([file_names.get(fid, {"id": fid}) for fid in cycle])
+
+        return {
+            "cycles": cycle_results[:50],
+            "cycle_count": len(cycle_results),
+        }
+    finally:
+        conn.close()
+
+
+def tool_get_code_impact(args):
+    """Blast radius de uma funcao: se mudar esta funcao, quais outras sao afetadas?
+    Faz BFS no grafo de CALLS_FUNC a partir da funcao.
+    Args: function (id ou qualified_name), max_depth? (default 3, max 5)"""
+    func_ref = args["function"]
+    if not isinstance(func_ref, (int, str)):
+        raise ValueError("function deve ser id (int) ou qualified_name (str)")
+    max_depth = min(args.get("max_depth", 3), 5)
+    if max_depth < 1:
+        raise ValueError("max_depth deve ser >= 1")
+
+    conn = get_db()
+    try:
+        func_id = _resolve_node(conn, func_ref)
+        if func_id is None:
+            return {"error": f"Funcao nao encontrada: {func_ref}"}
+
+        # Verificar que e uma Function
+        row = conn.execute("SELECT label, name FROM nodes WHERE id = ?", (func_id,)).fetchone()
+        if not row or row["label"] != "Function":
+            return {"error": f"No nao e uma funcao: {func_ref} (label: {row['label'] if row else '?'})"}
+
+        # BFS no grafo de CALLS_FUNC (outgoing: quem esta funcao chama)
+        # e incoming (quem chama esta funcao)
+        by_depth = {}
+        visited = {func_id}
+        queue = deque([(func_id, 0)])
+
+        while queue:
+            current, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            # Quem esta funcao chama (outgoing)
+            out_rows = conn.execute(
+                "SELECT target_id FROM edges WHERE source_id = ? AND type = 'CALLS_FUNC'",
+                (current,),
+            ).fetchall()
+            # Quem chama esta funcao (incoming)
+            in_rows = conn.execute(
+                "SELECT source_id FROM edges WHERE target_id = ? AND type = 'CALLS_FUNC'",
+                (current,),
+            ).fetchall()
+
+            for r in list(out_rows) + list(in_rows):
+                nid = r[0]
+                if nid not in visited:
+                    visited.add(nid)
+                    next_depth = depth + 1
+                    by_depth.setdefault(next_depth, []).append(nid)
+                    queue.append((nid, next_depth))
+
+        # Resolver nomes
+        affected_ids = set()
+        for ids in by_depth.values():
+            affected_ids.update(ids)
+        node_info = {}
+        if affected_ids:
+            if len(affected_ids) > 900:
+                affected_ids = set(list(affected_ids)[:900])
+            placeholders = ",".join("?" * len(affected_ids))
+            for r in conn.execute(
+                f"SELECT id, label, name, qualified_name FROM nodes WHERE id IN ({placeholders})",
+                list(affected_ids),
+            ).fetchall():
+                node_info[r["id"]] = {"id": r["id"], "label": r["label"], "name": r["name"], "qualified_name": r["qualified_name"]}
+
+        by_depth_serialized = {str(k): [node_info.get(nid, {"id": nid}) for nid in v] for k, v in sorted(by_depth.items())}
+
+        return {
+            "function": {"id": func_id, "name": row["name"]},
+            "affected_count": len(affected_ids),
+            "by_depth": by_depth_serialized,
+        }
+    finally:
+        conn.close()
 
 TOOLS = {
     "list_projects": {"fn": tool_list_projects, "desc": "Lista grafos disponiveis e estatisticas"},
@@ -1983,6 +3080,19 @@ TOOLS = {
     "health_check": {"fn": tool_health_check, "desc": "Health check: status (ok/degraded/critical), db_size, node_count, latency_p50, error_rate, integrity"},
     "integrity_check": {"fn": tool_integrity_check, "desc": "Verifica integridade do banco SQLite. Retorna: ok ou lista de problemas"},
     "backup": {"fn": tool_backup, "desc": "Cria backup manual do banco via VACUUM INTO. Args: output_path?"},
+    "get_impact": {"fn": tool_get_impact, "desc": "Blast radius de um no: nos afetados agrupados por distancia (BFS). Args: node (id ou qualified_name), max_depth? (default 3, max 5), direction? (outgoing/incoming/both)"},
+    "trace_paths": {"fn": tool_trace_paths, "desc": "Multiplos caminhos entre dois nos (DFS iterativo). Args: source, target, max_paths? (default 3, max 10), max_hops? (default 8, max 15)"},
+    "explain_node": {"fn": tool_explain_node, "desc": "Subgrafo ao redor de um no com contexto: vizinhos, arestas e propriedades. Args: node (id ou qualified_name), depth? (default 1, max 2), limit_neighbors? (default 20, max 50)"},
+    "what_if_remove": {"fn": tool_what_if_remove, "desc": "Simula remocao de um no: arestas perdidas, nos isolados, comunidades afetadas. Args: node (id ou qualified_name)"},
+    "replay_trace": {"fn": tool_replay_trace, "desc": "Reconstroi fluxo de execucao de um trace_id: spans ordenados, duracao, erros, arvore de chamadas. Args: trace_id, limit? (default 100, max 500)"},
+    "get_impact_summary": {"fn": tool_get_impact_summary, "desc": "Resume impacto de um tipo de aresta: nos dependentes, labels afetados. Args: edge_type, limit? (default 20)"},
+    "find_orphans": {"fn": tool_find_orphans, "desc": "Encontra nos isolados (sem arestas) e arestas com provenance AMBIGUOUS. Args: limit? (default 50, max 200)"},
+    # Tools de codigo (AST parsing, como graphify mas leve)
+    "scan_codebase": {"fn": tool_scan_codebase, "desc": "Mapeia diretorio de codigo Python via ast module (zero deps). Extrai functions, classes, imports, calls. Args: path, max_files? (default 200), exclude?"},
+    "get_call_graph": {"fn": tool_get_call_graph, "desc": "Grafo de chamadas: quem chama quem. Args: project? (qualified_name), direction? (outgoing/incoming/both), limit? (default 100)"},
+    "get_import_graph": {"fn": tool_get_import_graph, "desc": "Grafo de imports: quais arquivos importam quais modulos. Args: project?, limit? (default 100)"},
+    "find_circular_imports": {"fn": tool_find_circular_imports, "desc": "Detecta imports circulares via DFS no grafo de imports. Args: project?, max_depth? (default 10)"},
+    "get_code_impact": {"fn": tool_get_code_impact, "desc": "Blast radius de uma funcao: se mudar esta funcao, quais outras sao afetadas. Args: function (id ou qualified_name), max_depth? (default 3)"},
 }
 
 
@@ -2044,14 +3154,23 @@ def handle_request(request):
             args_summary = _redact_pii(json.dumps({k: ("..." if isinstance(v, str) and len(v) > 100 else v) for k, v in tool_args.items()}, ensure_ascii=False))
             try:
                 conn = get_db()
+                # Incluir agent_id e cost_usd se presentes nos args (migracao condicional)
+                extra_cols = ""
+                extra_vals = []
+                if "agent_id" in tool_args:
+                    extra_cols += ", agent_id"
+                    extra_vals.append(tool_args["agent_id"])
+                if "cost_usd" in tool_args:
+                    extra_cols += ", cost_usd"
+                    extra_vals.append(tool_args["cost_usd"])
                 conn.execute(
-                    "INSERT INTO telemetry_spans (trace_id, span_id, tool, duration_ms, args_summary, result_size) VALUES (?, ?, ?, ?, ?, ?)",
-                    (trace_id, span_id, tool_name, round(duration_ms, 2), args_summary, len(result_json)),
+                    f"INSERT INTO telemetry_spans (trace_id, span_id, tool, duration_ms, args_summary, result_size{extra_cols}) VALUES (?, ?, ?, ?, ?, ?{',?' * len(extra_vals)})",
+                    (trace_id, span_id, tool_name, round(duration_ms, 2), args_summary, len(result_json), *extra_vals),
                 )
                 conn.commit()
                 conn.close()
             except sqlite3.OperationalError:
-                pass  # tabela telemetry_spans pode nao existir em DBs antigos
+                pass  # tabela telemetry_spans ou colunas podem nao existir em DBs antigos
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": result_json}]},
@@ -2171,6 +3290,21 @@ def main():
     if schema_path.exists():
         conn = sqlite3.connect(DB_PATH)
         conn.executescript(schema_path.read_text())
+        # Migracao: adicionar colunas novas em telemetry_spans para DBs existentes
+        # SQLite nao tem IF NOT EXISTS em ALTER TABLE, então checar PRAGMA antes
+        # Allowlist defensiva: col e coltype sao hardcoded, mas validamos por seguranca
+        _MIGRATION_COLS = {"agent_id": "TEXT", "cost_usd": "REAL", "checkpoint": "TEXT"}
+        try:
+            existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(telemetry_spans)").fetchall()}
+        except sqlite3.OperationalError:
+            existing_cols = set()  # tabela nao existe ainda
+        for col, coltype in _MIGRATION_COLS.items():
+            if col not in existing_cols and col in _MIGRATION_COLS:
+                try:
+                    conn.execute(f"ALTER TABLE telemetry_spans ADD COLUMN {col} {coltype}")
+                except sqlite3.OperationalError:
+                    pass  # ja existe (race) ou erro temporario
+        conn.commit()
         conn.close()
 
     # Signal handlers: SIGTERM/SIGINT -> graceful shutdown

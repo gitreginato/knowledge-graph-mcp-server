@@ -391,7 +391,7 @@ def suite_protocolo():
 
     # 60. tools/list
     r = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-    test("tools/list retorna 24 tools", len(r["result"]["tools"]) == 24, f"got {len(r['result']['tools'])}")
+    test("tools/list retorna 36 tools", len(r["result"]["tools"]) == 36, f"got {len(r['result']['tools'])}")
 
     # 61. notifications/initialized (sem resposta)
     r = server.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})

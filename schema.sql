@@ -120,6 +120,10 @@ CREATE TABLE IF NOT EXISTS telemetry_spans (
     timestamp TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Migracao segura para DBs existentes: o server.py faz PRAGMA table_info + ALTER TABLE
+-- condicional (ver main()), nao rodamos ALTER direto aqui para evitar OperationalError
+-- em DBs onde as colunas ja existem.
+
 CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_spans(timestamp);
 CREATE INDEX IF NOT EXISTS idx_telemetry_tool ON telemetry_spans(tool);
 CREATE INDEX IF NOT EXISTS idx_telemetry_trace ON telemetry_spans(trace_id);

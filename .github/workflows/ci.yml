@@ -8,7 +8,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pytest
-      - run: python -m pytest test_kg_infra.py -x -q
+      - run: python test_kg_infra.py
       - run: python -c "import server; print('import ok')"
       - run: python -c "import cli; print('cli ok')"
